@@ -35,7 +35,7 @@ fun main() {
                   "content": "$userInput"
               }
           ],
-          "stop":["3."] 
+          "stop":[] 
         }
         """.trimIndent()
 
