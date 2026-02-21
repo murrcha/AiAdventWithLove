@@ -8,12 +8,8 @@ data class ChatCompletionResponse(
     val id: String,
     val provider: String,
     val model: String,
-    @SerialName("object")
-    val objectType: String,
-    val created: Long,
+    val created: Long?,
     val choices: List<Choice>,
-    @SerialName("system_fingerprint")
-    val systemFingerprint: String,
     val usage: Usage
 )
 
@@ -21,9 +17,9 @@ data class ChatCompletionResponse(
 data class Choice(
     val logprobs: String? = null,
     @SerialName("finish_reason")
-    val finishReason: String,
+    val finishReason: String?,
     @SerialName("native_finish_reason")
-    val nativeFinishReason: String,
+    val nativeFinishReason: String?,
     val index: Int,
     val message: Message
 )
@@ -41,13 +37,13 @@ data class Usage(
     @SerialName("total_tokens")
     val totalTokens: Int,
     @SerialName("prompt_tokens")
-    val promptTokens: Int,
+    val promptTokens: Int?,
     @SerialName("prompt_tokens_details")
-    val promptTokensDetails: TokenDetails,
+    val promptTokensDetails: TokenDetails?,
     @SerialName("completion_tokens")
-    val completionTokens: Int,
+    val completionTokens: Int?,
     @SerialName("completion_tokens_details")
-    val completionTokensDetails: CompletionTokenDetails
+    val completionTokensDetails: CompletionTokenDetails?
 )
 
 @Serializable
