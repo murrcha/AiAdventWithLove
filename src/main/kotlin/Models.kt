@@ -51,7 +51,7 @@ data class TokenDetails(
     @SerialName("cached_tokens")
     val cachedTokens: Int,
     @SerialName("audio_tokens")
-    val audioTokens: Int
+    val audioTokens: Int = 0,
 )
 
 @Serializable
@@ -59,6 +59,6 @@ data class CompletionTokenDetails(
     @SerialName("reasoning_tokens")
     val reasoningTokens: Int,
     @SerialName("audio_tokens")
-    val audioTokens: Int
+    val audioTokens: Int = 0,
 )
 
