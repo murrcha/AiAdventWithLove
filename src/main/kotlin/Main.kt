@@ -35,7 +35,7 @@ fun main() {
                   "content": "$userInput"
               }
           ],
-          "stop":[] 
+          "temperature": 0.7
         }
         """.trimIndent()
 
