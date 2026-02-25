@@ -5,17 +5,19 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.example.Secret.API_KEY
+import org.example.Secret.DEFAULT_MODEL
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import java.io.File
 
 // 1. Модели данных для сериализации (Data Classes)
 
 @Serializable
 data class Message(
-    val role: String, // "system", "user", "assistant"
+    val role: String,
     val content: String
 )
 
@@ -52,34 +54,43 @@ class RouterAIAgent(
     private val apiUrl: String,
     private val apiKey: String,
     private val model: String,
-    private val systemPrompt: String = "Ты полезный ассистент."
+    private val systemPrompt: String = "Ты полезный ассистент.",
+    private val historyFile: File // Добавили параметр файла для истории
 ) {
-    // Хранилище контекста (истории разговора)
-    private val messageHistory: MutableList<Message> = mutableListOf(
-        Message(role = "system", content = systemPrompt)
-    )
+    // Хранилище контекста
+    private val messageHistory: MutableList<Message> = mutableListOf()
 
-    // Настройка JSON сериализатора (игнорирует неизвестные поля, чтобы API не ломало код)
-    private val json = Json { ignoreUnknownKeys = true }
+    // Настройка JSON сериализатора
+    private val json = Json {
+        ignoreUnknownKeys = true
+        prettyPrint = true // Для красивого форматирования файла истории
+    }
 
-    // HTTP Клиент (Java 11+)
+    // HTTP Клиент
     private val client = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(10))
         .build()
 
+    init {
+        // При инициализации агента пытаемся загрузить историю
+        loadHistory()
+        // Если история пуста (файла не было), добавляем системный промпт
+        if (messageHistory.isEmpty()) {
+            messageHistory.add(Message(role = "system", content = systemPrompt))
+        }
+    }
+
     // Метод отправки сообщения
     fun sendMessage(userInput: String): String {
-        // 1. Добавляем сообщение пользователя в историю
+        // Добавляем сообщение пользователя
         messageHistory.add(Message(role = "user", content = userInput))
 
-        // 2. Формируем тело запроса
         val requestBody = ChatRequest(
             model = model,
             messages = messageHistory
         )
         val requestBodyString = json.encodeToString(requestBody)
 
-        // 3. Создаем HTTP запрос
         val request = HttpRequest.newBuilder()
             .uri(URI.create(apiUrl))
             .header("Content-Type", "application/json")
@@ -87,33 +98,36 @@ class RouterAIAgent(
             .POST(HttpRequest.BodyPublishers.ofString(requestBodyString))
             .build()
 
-        // 4. Выполняем запрос синхронно (можно использовать .sendAsync для асинхронности)
         return try {
             val response = client.send(request, HttpResponse.BodyHandlers.ofString())
 
             if (response.statusCode() == 200) {
-                // 5. Парсим ответ
                 val chatResponse = json.decodeFromString<ChatResponse>(response.body())
 
-                // Проверка на ошибки в теле ответа
                 if (chatResponse.error != null) {
+                    // Если ошибка API, удаляем последнее сообщение пользователя, чтобы не ломать контекст
+                    messageHistory.removeLast()
                     return "API Error: ${chatResponse.error.message}"
                 }
 
                 val assistantMessage = chatResponse.choices?.firstOrNull()?.message
 
                 if (assistantMessage != null) {
-                    // 6. Сохраняем ответ ассистента в историю
                     messageHistory.add(assistantMessage)
+                    // Сохраняем историю после успешного ответа
+                    saveHistory()
                     assistantMessage.content
                 } else {
+                    messageHistory.removeLast() // Откат
                     "Error: No response choices found."
                 }
             } else {
+                messageHistory.removeLast() // Откат
                 "HTTP Error: ${response.statusCode()} - ${response.body()}"
             }
         } catch (e: Exception) {
             e.printStackTrace()
+            messageHistory.removeLast() // Откат при исключении
             "Exception: ${e.message}"
         }
     }
@@ -122,23 +136,59 @@ class RouterAIAgent(
     fun resetContext() {
         messageHistory.clear()
         messageHistory.add(Message(role = "system", content = systemPrompt))
+        saveHistory() // Сохраняем пустую историю (только с system prompt)
+        println("Контекст очищен и сохранен.")
+    }
+
+    // Новые методы для работы с файлом
+
+    private fun saveHistory() {
+        try {
+            // Записываем текущий список сообщений в файл
+            historyFile.writeText(json.encodeToString(messageHistory))
+        } catch (e: Exception) {
+            println("Ошибка сохранения истории: ${e.message}")
+        }
+    }
+
+    private fun loadHistory() {
+        try {
+            if (historyFile.exists()) {
+                // Читаем файл и десериализуем в список
+                val text = historyFile.readText()
+                if (text.isNotBlank()) {
+                    val loadedMessages = json.decodeFromString<List<Message>>(text)
+                    messageHistory.clear()
+                    messageHistory.addAll(loadedMessages)
+                    println("История загружена (${messageHistory.size} сообщений).")
+                }
+            }
+        } catch (e: Exception) {
+            println("Ошибка загрузки истории: ${e.message}. Начинаем с чистого листа.")
+            messageHistory.clear()
+        }
     }
 }
 
 // 3. Пример использования (Main)
 
 fun main() {
-    // Настройки (замените на свои)
-    // Если это OpenRouter, URL обычно: "https://openrouter.ai/api/v1/chat/completions"
-    val modelId = "deepseek/deepseek-chat-v3.1" // Пример модели
+    val url = "https://routerai.ru/api/v1/chat/completions"
+    val key = API_KEY
+    val modelId = DEFAULT_MODEL
+
+    // Определяем файл для хранения истории (в корне проекта)
+    val historyFile = File("chat_history.json")
 
     val agent = RouterAIAgent(
-        apiUrl = "https://routerai.ru/api/v1/chat/completions",
-        apiKey = API_KEY,
-        model = modelId
+        apiUrl = url,
+        apiKey = key,
+        model = modelId,
+        historyFile = historyFile
     )
 
     println("--- Чат начат (напишите 'exit' для выхода, 'clear' для сброса) ---")
+    println("История хранится в файле: ${historyFile.absolutePath}")
 
     while (true) {
         print("Вы: ")
@@ -147,7 +197,6 @@ fun main() {
         if (input.equals("exit", ignoreCase = true)) break
         if (input.equals("clear", ignoreCase = true)) {
             agent.resetContext()
-            println("Контекст очищен.")
             continue
         }
 
