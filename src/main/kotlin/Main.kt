@@ -6,6 +6,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.example.Secret.API_KEY
 import org.example.Secret.DEFAULT_MODEL
+import org.example.Secret.URL
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -13,13 +14,18 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.io.File
 
-// 1. Модели данных для сериализации (Data Classes)
+// 1. Модели данных
 
 @Serializable
 data class Message(
     val role: String,
     val content: String
-)
+) {
+    // Вспомогательное свойство для оценки токенов в этом сообщении
+    // Формула: (длина строки / 4) + 4 токена на служебные нужды (role, форматирование json)
+    val estimatedTokens: Int
+        get() = (content.length / 4) + 4
+}
 
 @Serializable
 data class ChatRequest(
@@ -31,6 +37,7 @@ data class ChatRequest(
 data class ChatResponse(
     val id: String? = null,
     val choices: List<Choice>? = null,
+    val usage: Usage? = null, // Добавляем поле usage для получения точных данных от API
     val error: ApiError? = null
 )
 
@@ -48,6 +55,17 @@ data class ApiError(
     val type: String? = null
 )
 
+// Новая модель для статистики использования токенов (если API возвращает)
+@Serializable
+data class Usage(
+    @SerialName("prompt_tokens")
+    val promptTokens: Int? = null,
+    @SerialName("completion_tokens")
+    val completionTokens: Int? = null,
+    @SerialName("total_tokens")
+    val totalTokens: Int? = null
+)
+
 // 2. Класс Агента
 
 class RouterAIAgent(
@@ -55,40 +73,30 @@ class RouterAIAgent(
     private val apiKey: String,
     private val model: String,
     private val systemPrompt: String = "Ты полезный ассистент.",
-    private val historyFile: File // Добавили параметр файла для истории
+    private val historyFile: File
 ) {
-    // Хранилище контекста
     private val messageHistory: MutableList<Message> = mutableListOf()
-
-    // Настройка JSON сериализатора
-    private val json = Json {
-        ignoreUnknownKeys = true
-        prettyPrint = true // Для красивого форматирования файла истории
-    }
-
-    // HTTP Клиент
+    private val json = Json { ignoreUnknownKeys = true; prettyPrint = true }
     private val client = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(10))
         .build()
 
     init {
-        // При инициализации агента пытаемся загрузить историю
         loadHistory()
-        // Если история пуста (файла не было), добавляем системный промпт
         if (messageHistory.isEmpty()) {
             messageHistory.add(Message(role = "system", content = systemPrompt))
         }
     }
 
-    // Метод отправки сообщения
     fun sendMessage(userInput: String): String {
-        // Добавляем сообщение пользователя
-        messageHistory.add(Message(role = "user", content = userInput))
+        val userMessage = Message(role = "user", content = userInput)
+        messageHistory.add(userMessage)
 
-        val requestBody = ChatRequest(
-            model = model,
-            messages = messageHistory
-        )
+        // 1. Оценка токенов запроса (Prompts)
+        // Это сумма токенов всей истории, которую мы шлем в API
+        val promptTokensEstimated = messageHistory.sumOf { it.estimatedTokens }
+
+        val requestBody = ChatRequest(model = model, messages = messageHistory)
         val requestBodyString = json.encodeToString(requestBody)
 
         val request = HttpRequest.newBuilder()
@@ -105,7 +113,6 @@ class RouterAIAgent(
                 val chatResponse = json.decodeFromString<ChatResponse>(response.body())
 
                 if (chatResponse.error != null) {
-                    // Если ошибка API, удаляем последнее сообщение пользователя, чтобы не ломать контекст
                     messageHistory.removeLast()
                     return "API Error: ${chatResponse.error.message}"
                 }
@@ -114,37 +121,68 @@ class RouterAIAgent(
 
                 if (assistantMessage != null) {
                     messageHistory.add(assistantMessage)
-                    // Сохраняем историю после успешного ответа
                     saveHistory()
+
+                    // 2. Подсчет токенов ответа
+                    val completionTokensEstimated = assistantMessage.estimatedTokens
+
+                    // Вывод статистики
+                    printTokenStats(
+                        apiUsage = chatResponse.usage, // Точные данные от API (если есть)
+                        estimatedPrompt = promptTokensEstimated,
+                        estimatedCompletion = completionTokensEstimated
+                    )
+
                     assistantMessage.content
                 } else {
-                    messageHistory.removeLast() // Откат
+                    messageHistory.removeLast()
                     "Error: No response choices found."
                 }
             } else {
-                messageHistory.removeLast() // Откат
+                messageHistory.removeLast()
                 "HTTP Error: ${response.statusCode()} - ${response.body()}"
             }
         } catch (e: Exception) {
             e.printStackTrace()
-            messageHistory.removeLast() // Откат при исключении
+            messageHistory.removeLast()
             "Exception: ${e.message}"
         }
     }
 
-    // Метод для очистки контекста
+    // Метод вывода статистики
+    private fun printTokenStats(apiUsage: Usage?, estimatedPrompt: Int, estimatedCompletion: Int) {
+        println("\n--- Token Stats ---")
+
+        // Выводим оценку (всегда доступна)
+        println("Estimated Prompt Tokens (History): $estimatedPrompt")
+        println("Estimated Completion Tokens: $estimatedCompletion")
+
+        // Если API вернуло точные данные (OpenAI, DeepSeek часто это делают), выводим их
+        if (apiUsage != null) {
+            println("API Reported Prompt Tokens: ${apiUsage.promptTokens}")
+            println("API Reported Completion Tokens: ${apiUsage.completionTokens}")
+            println("API Reported Total Tokens: ${apiUsage.totalTokens}")
+        } else {
+            println("API did not report usage stats.")
+        }
+        println("--------------------")
+    }
+
     fun resetContext() {
         messageHistory.clear()
         messageHistory.add(Message(role = "system", content = systemPrompt))
-        saveHistory() // Сохраняем пустую историю (только с system prompt)
-        println("Контекст очищен и сохранен.")
+        saveHistory()
+        println("Контекст очищен.")
     }
 
-    // Новые методы для работы с файлом
+    // Функция для просмотра текущего расхода токенов без запроса
+    fun printCurrentContextSize() {
+        val total = messageHistory.sumOf { it.estimatedTokens }
+        println("Current context size (estimated): $total tokens")
+    }
 
     private fun saveHistory() {
         try {
-            // Записываем текущий список сообщений в файл
             historyFile.writeText(json.encodeToString(messageHistory))
         } catch (e: Exception) {
             println("Ошибка сохранения истории: ${e.message}")
@@ -154,7 +192,6 @@ class RouterAIAgent(
     private fun loadHistory() {
         try {
             if (historyFile.exists()) {
-                // Читаем файл и десериализуем в список
                 val text = historyFile.readText()
                 if (text.isNotBlank()) {
                     val loadedMessages = json.decodeFromString<List<Message>>(text)
@@ -164,20 +201,18 @@ class RouterAIAgent(
                 }
             }
         } catch (e: Exception) {
-            println("Ошибка загрузки истории: ${e.message}. Начинаем с чистого листа.")
+            println("Ошибка загрузки истории: ${e.message}")
             messageHistory.clear()
         }
     }
 }
 
-// 3. Пример использования (Main)
+// 3. Main
 
 fun main() {
-    val url = "https://routerai.ru/api/v1/chat/completions"
+    val url = URL
     val key = API_KEY
     val modelId = DEFAULT_MODEL
-
-    // Определяем файл для хранения истории (в корне проекта)
     val historyFile = File("chat_history.json")
 
     val agent = RouterAIAgent(
@@ -187,8 +222,7 @@ fun main() {
         historyFile = historyFile
     )
 
-    println("--- Чат начат (напишите 'exit' для выхода, 'clear' для сброса) ---")
-    println("История хранится в файле: ${historyFile.absolutePath}")
+    println("--- Чат начат (напишите 'exit' для выхода, 'clear' для сброса, 'stats' для размера контекста) ---")
 
     while (true) {
         print("Вы: ")
@@ -197,6 +231,10 @@ fun main() {
         if (input.equals("exit", ignoreCase = true)) break
         if (input.equals("clear", ignoreCase = true)) {
             agent.resetContext()
+            continue
+        }
+        if (input.equals("stats", ignoreCase = true)) {
+            agent.printCurrentContextSize()
             continue
         }
 
