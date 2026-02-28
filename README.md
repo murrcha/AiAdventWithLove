@@ -15,3 +15,5 @@ day 6 video https://disk.yandex.ru/d/VaFDC5rsrWUGDA
 day 7 video https://disk.yandex.ru/i/njv3atdaus4GDw
 
 day 8 video https://disk.yandex.ru/i/vNuu7DnNnLP9Bw
+
+day 9 video https://disk.yandex.ru/d/XBSMltiq_Qtegw

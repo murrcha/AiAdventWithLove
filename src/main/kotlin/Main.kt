@@ -21,8 +21,6 @@ data class Message(
     val role: String,
     val content: String
 ) {
-    // Вспомогательное свойство для оценки токенов в этом сообщении
-    // Формула: (длина строки / 4) + 4 токена на служебные нужды (role, форматирование json)
     val estimatedTokens: Int
         get() = (content.length / 4) + 4
 }
@@ -37,7 +35,7 @@ data class ChatRequest(
 data class ChatResponse(
     val id: String? = null,
     val choices: List<Choice>? = null,
-    val usage: Usage? = null, // Добавляем поле usage для получения точных данных от API
+    val usage: Usage? = null,
     val error: ApiError? = null
 )
 
@@ -55,7 +53,6 @@ data class ApiError(
     val type: String? = null
 )
 
-// Новая модель для статистики использования токенов (если API возвращает)
 @Serializable
 data class Usage(
     @SerialName("prompt_tokens")
@@ -66,6 +63,13 @@ data class Usage(
     val totalTokens: Int? = null
 )
 
+// Контейнер для сохранения состояния (для JSON файла)
+@Serializable
+data class AgentState(
+    val summary: String? = null, // Текст саммари прошлых диалогов
+    val recentMessages: List<Message> = emptyList() // Последние N сообщений
+)
+
 // 2. Класс Агента
 
 class RouterAIAgent(
@@ -73,30 +77,46 @@ class RouterAIAgent(
     private val apiKey: String,
     private val model: String,
     private val systemPrompt: String = "Ты полезный ассистент.",
-    private val historyFile: File
+    private val historyFile: File,
+    private val keepRecentMessages: Int = 10, // Сколько последних сообщений хранить "как есть"
+    private val summarizeThreshold: Int = 10  // Каждые сколько сообщений делать сжатие
 ) {
-    private val messageHistory: MutableList<Message> = mutableListOf()
+    // Состояние агента
+    private var summaryText: String? = null
+    private val recentHistory: MutableList<Message> = mutableListOf()
+
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = true }
     private val client = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(10))
+        .connectTimeout(Duration.ofSeconds(20))
         .build()
 
     init {
-        loadHistory()
-        if (messageHistory.isEmpty()) {
-            messageHistory.add(Message(role = "system", content = systemPrompt))
+        loadState()
+        // Если история пуста, добавляем системный промпт
+        if (recentHistory.isEmpty()) {
+            recentHistory.add(Message(role = "system", content = systemPrompt))
         }
     }
 
     fun sendMessage(userInput: String): String {
-        val userMessage = Message(role = "user", content = userInput)
-        messageHistory.add(userMessage)
+        // 1. Добавляем сообщение пользователя
+        recentHistory.add(Message(role = "user", content = userInput))
 
-        // 1. Оценка токенов запроса (Prompts)
-        // Это сумма токенов всей истории, которую мы шлем в API
-        val promptTokensEstimated = messageHistory.sumOf { it.estimatedTokens }
+        // 2. Проверяем, нужно ли сжатие контекста
+        // Учитываем только сообщения user/assistant (не system)
+        val conversationLength = recentHistory.count { it.role != "system" }
 
-        val requestBody = ChatRequest(model = model, messages = messageHistory)
+        // Если превысили порог (например, 20 сообщений), запускаем суммаризацию
+        // оставляя при этом keepRecentMessages (10) последних
+        if (conversationLength >= (keepRecentMessages + summarizeThreshold)) {
+            println("[System] Threshold reached. Summarizing context...")
+            summarizeContext()
+        }
+
+        // 3. Формируем запрос к API
+        val messagesForApi = buildMessagesForApi()
+
+        val requestBody = ChatRequest(model = model, messages = messagesForApi)
         val requestBodyString = json.encodeToString(requestBody)
 
         val request = HttpRequest.newBuilder()
@@ -113,96 +133,182 @@ class RouterAIAgent(
                 val chatResponse = json.decodeFromString<ChatResponse>(response.body())
 
                 if (chatResponse.error != null) {
-                    messageHistory.removeLast()
+                    recentHistory.removeLast() // Откат
                     return "API Error: ${chatResponse.error.message}"
                 }
 
                 val assistantMessage = chatResponse.choices?.firstOrNull()?.message
 
                 if (assistantMessage != null) {
-                    messageHistory.add(assistantMessage)
-                    saveHistory()
+                    recentHistory.add(assistantMessage)
+                    saveState()
 
-                    // 2. Подсчет токенов ответа
-                    val completionTokensEstimated = assistantMessage.estimatedTokens
-
-                    // Вывод статистики
-                    printTokenStats(
-                        apiUsage = chatResponse.usage, // Точные данные от API (если есть)
-                        estimatedPrompt = promptTokensEstimated,
-                        estimatedCompletion = completionTokensEstimated
-                    )
+                    // Статистика токенов
+                    val promptTokens = messagesForApi.sumOf { it.estimatedTokens }
+                    printTokenStats(chatResponse.usage, promptTokens, assistantMessage.estimatedTokens)
 
                     assistantMessage.content
                 } else {
-                    messageHistory.removeLast()
+                    recentHistory.removeLast()
                     "Error: No response choices found."
                 }
             } else {
-                messageHistory.removeLast()
+                recentHistory.removeLast()
                 "HTTP Error: ${response.statusCode()} - ${response.body()}"
             }
         } catch (e: Exception) {
             e.printStackTrace()
-            messageHistory.removeLast()
+            recentHistory.removeLast()
             "Exception: ${e.message}"
         }
     }
 
-    // Метод вывода статистики
+    // Метод формирования сообщений для API: Summary + Recent History
+    private fun buildMessagesForApi(): List<Message> {
+        val fullList = mutableListOf<Message>()
+
+        // 1. Если есть summary, добавляем его как System сообщение в начало
+        if (!summaryText.isNullOrBlank()) {
+            fullList.add(Message(role = "system", content = "Краткая сводка предыдущих разговоров: $summaryText"))
+        }
+
+        // 2. Добавляем последние сообщения
+        // Важно: если summary нет, то первое сообщение в recentHistory должно быть system prompt
+        fullList.addAll(recentHistory)
+
+        return fullList
+    }
+
+    // Метод сжатия контекста
+    private fun summarizeContext() {
+        // Берем сообщения для сжатия (все, кроме последних keepRecentMessages)
+        // Также исключаем текущий System Prompt (он всегда первый в recentHistory)
+
+        // Индекс, до которого будем суммаризировать
+        // Структура recentHistory: [SystemPrompt, User1, Asst1, User2, Asst2, ... UserLast]
+        // Мы хотим оставить [SystemPrompt, ... UserLast-keepRecent]
+
+        // Считаем сколько сообщений "сверху" забрать.
+        // Если recentHistory = [Sys, U1, A1, U2, A2, U3, A3], keep=2.
+        // Надо забрать [U1, A1] в summary. Оставить [Sys, U2, A2, U3, A3].
+
+        // Вычисляем индекс разделителя.
+        // System prompt (1) + (Total - keepRecent - 1) ?
+        // Проще: взять срез от индекса 1 (пропуск system) до (size - keepRecent)
+
+        val totalSize = recentHistory.size
+        // Оставляем System (index 0) и последние N сообщений
+        val splitIndex = totalSize - keepRecentMessages
+
+        if (splitIndex <= 1) return // Нечего суммаризировать
+
+        val toSummarize = recentHistory.subList(1, splitIndex).toList()
+
+        if (toSummarize.isEmpty()) return
+
+        // Формируем промпт для суммаризации
+        val historyText = toSummarize.joinToString("\n") { "${it.role}: ${it.content}" }
+        val summaryPrompt = """
+            Проанализируй следующую часть диалога и составь краткую сводку (summary) основных фактов, решений и контекста.
+            Диалог:
+            $historyText
+            
+            Сводка (на русском языке):
+        """.trimIndent()
+
+        // Делаем отдельный запрос к LLM для получения summary
+        val summaryResult = callLLMForSummary(summaryPrompt)
+
+        if (summaryResult != null) {
+            // Обновляем summary текст (добавляем к старому, если было)
+            if (summaryText.isNullOrBlank()) {
+                summaryText = summaryResult
+            } else {
+                summaryText += "\nНовые детали: $summaryResult"
+            }
+
+            // Удаляем старые сообщения из recentHistory
+            // (удаляем элементы с 1 по splitIndex)
+            // subList возвращает view, и clear() удаляет их из оригинального списка
+            recentHistory.subList(1, splitIndex).clear()
+
+            println("[System] Context summarized. New history size: ${recentHistory.size}")
+            saveState()
+        }
+    }
+
+    // Вспомогательный метод для вызова LLM (для суммаризации)
+    private fun callLLMForSummary(prompt: String): String? {
+        val messages = listOf(Message(role = "user", content = prompt))
+        val requestBody = ChatRequest(model = model, messages = messages)
+
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create(apiUrl))
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer $apiKey")
+            .POST(HttpRequest.BodyPublishers.ofString(json.encodeToString(requestBody)))
+            .build()
+
+        return try {
+            val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+            if (response.statusCode() == 200) {
+                val chatResponse = json.decodeFromString<ChatResponse>(response.body())
+                chatResponse.choices?.firstOrNull()?.message?.content
+            } else null
+        } catch (e: Exception) {
+            println("Error during summarization: ${e.message}")
+            null
+        }
+    }
+
     private fun printTokenStats(apiUsage: Usage?, estimatedPrompt: Int, estimatedCompletion: Int) {
         println("\n--- Token Stats ---")
-
-        // Выводим оценку (всегда доступна)
-        println("Estimated Prompt Tokens (History): $estimatedPrompt")
-        println("Estimated Completion Tokens: $estimatedCompletion")
-
-        // Если API вернуло точные данные (OpenAI, DeepSeek часто это делают), выводим их
+        println("Context sent tokens (Est): $estimatedPrompt")
         if (apiUsage != null) {
-            println("API Reported Prompt Tokens: ${apiUsage.promptTokens}")
-            println("API Reported Completion Tokens: ${apiUsage.completionTokens}")
-            println("API Reported Total Tokens: ${apiUsage.totalTokens}")
-        } else {
-            println("API did not report usage stats.")
+            println("API Reported Prompt: ${apiUsage.promptTokens}, Completion: ${apiUsage.completionTokens}")
         }
         println("--------------------")
     }
 
     fun resetContext() {
-        messageHistory.clear()
-        messageHistory.add(Message(role = "system", content = systemPrompt))
-        saveHistory()
-        println("Контекст очищен.")
+        recentHistory.clear()
+        summaryText = null
+        recentHistory.add(Message(role = "system", content = systemPrompt))
+        saveState()
+        println("Контекст полностью очищен.")
     }
 
-    // Функция для просмотра текущего расхода токенов без запроса
-    fun printCurrentContextSize() {
-        val total = messageHistory.sumOf { it.estimatedTokens }
-        println("Current context size (estimated): $total tokens")
+    fun printCurrentState() {
+        println("Summary exists: ${!summaryText.isNullOrBlank()}")
+        println("Recent messages count: ${recentHistory.size}")
+        val totalTokens = buildMessagesForApi().sumOf { it.estimatedTokens }
+        println("Total active context tokens (Est): $totalTokens")
     }
 
-    private fun saveHistory() {
+    // Сохранение и загрузка состояния
+    private fun saveState() {
         try {
-            historyFile.writeText(json.encodeToString(messageHistory))
+            val state = AgentState(summary = summaryText, recentMessages = recentHistory)
+            historyFile.writeText(json.encodeToString(state))
         } catch (e: Exception) {
-            println("Ошибка сохранения истории: ${e.message}")
+            println("Error saving state: ${e.message}")
         }
     }
 
-    private fun loadHistory() {
+    private fun loadState() {
         try {
             if (historyFile.exists()) {
                 val text = historyFile.readText()
                 if (text.isNotBlank()) {
-                    val loadedMessages = json.decodeFromString<List<Message>>(text)
-                    messageHistory.clear()
-                    messageHistory.addAll(loadedMessages)
-                    println("История загружена (${messageHistory.size} сообщений).")
+                    val state = json.decodeFromString<AgentState>(text)
+                    this.summaryText = state.summary
+                    this.recentHistory.clear()
+                    this.recentHistory.addAll(state.recentMessages)
+                    println("State loaded. Summary: ${if(summaryText != null) "Yes" else "No"}, Recent: ${recentHistory.size}")
                 }
             }
         } catch (e: Exception) {
-            println("Ошибка загрузки истории: ${e.message}")
-            messageHistory.clear()
+            println("Error loading state: ${e.message}")
         }
     }
 }
@@ -212,17 +318,24 @@ class RouterAIAgent(
 fun main() {
     val url = URL
     val key = API_KEY
-    val modelId = DEFAULT_MODEL
-    val historyFile = File("chat_history.json")
+    val modelId = DEFAULT_MODEL // Или deepseek/deepseek-chat
 
+    // Файл теперь хранит структуру AgentState
+    val historyFile = File("agent_state.json")
+
+    // keepRecentMessages = 4 (2 пары вопрос-ответ)
+    // summarizeThreshold = 4 (сжимать каждые 4 сообщения сверх лимита)
     val agent = RouterAIAgent(
         apiUrl = url,
         apiKey = key,
         model = modelId,
-        historyFile = historyFile
+        historyFile = historyFile,
+        keepRecentMessages = 2, // Хранить только 2 последних сообщения
+        summarizeThreshold = 2  // Сжимать каждые 2 сообщения сверх лимита
     )
 
-    println("--- Чат начат (напишите 'exit' для выхода, 'clear' для сброса, 'stats' для размера контекста) ---")
+    println("--- Agent with Summary Context ---")
+    println("Commands: 'exit', 'clear', 'stats'")
 
     while (true) {
         print("Вы: ")
@@ -234,7 +347,7 @@ fun main() {
             continue
         }
         if (input.equals("stats", ignoreCase = true)) {
-            agent.printCurrentContextSize()
+            agent.printCurrentState()
             continue
         }
 
