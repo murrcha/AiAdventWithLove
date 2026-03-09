@@ -14,22 +14,15 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.io.File
 
-// 1. Модели данных
+// --- 1. Модели данных ---
 
 @Serializable
-data class Message(
-    val role: String,
-    val content: String
-) {
-    val estimatedTokens: Int
-        get() = (content.length / 4) + 4
+data class Message(val role: String, val content: String) {
+    val estimatedTokens: Int get() = (content.length / 4) + 4
 }
 
 @Serializable
-data class ChatRequest(
-    val model: String,
-    val messages: List<Message>
-)
+data class ChatRequest(val model: String, val messages: List<Message>)
 
 @Serializable
 data class ChatResponse(
@@ -40,208 +33,278 @@ data class ChatResponse(
 )
 
 @Serializable
-data class Choice(
-    val index: Int,
-    val message: Message,
-    @SerialName("finish_reason")
-    val finishReason: String? = null
-)
+data class Choice(val index: Int, val message: Message, @SerialName("finish_reason") val finishReason: String? = null)
 
 @Serializable
-data class ApiError(
-    val message: String,
-    val type: String? = null
-)
+data class ApiError(val message: String, val type: String? = null)
 
 @Serializable
 data class Usage(
-    @SerialName("prompt_tokens")
-    val promptTokens: Int? = null,
-    @SerialName("completion_tokens")
-    val completionTokens: Int? = null,
-    @SerialName("total_tokens")
-    val totalTokens: Int? = null
+    @SerialName("prompt_tokens") val promptTokens: Int? = null,
+    @SerialName("completion_tokens") val completionTokens: Int? = null,
+    @SerialName("total_tokens") val totalTokens: Int? = null
 )
 
-// Контейнер для сохранения состояния (для JSON файла)
+// Состояние для стратегии Facts
+@Serializable
+data class FactStore(val facts: MutableList<String> = mutableListOf())
+
+// Состояние для стратегии Branching
+@Serializable
+data class BranchData(
+    val branches: MutableMap<String, List<Message>> = mutableMapOf(),
+    var activeBranch: String = "main"
+)
+
+// Единое состояние агента
 @Serializable
 data class AgentState(
-    val summary: String? = null, // Текст саммари прошлых диалогов
-    val recentMessages: List<Message> = emptyList() // Последние N сообщений
+    var strategyType: String = "SLIDING_WINDOW",
+    var slidingHistory: MutableList<Message> = mutableListOf(), // Для Sliding Window
+    var factsStore: FactStore = FactStore(),         // Для Sticky Facts
+    var branchData: BranchData = BranchData(),       // Для Branching
+    var stickyHistory: MutableList<Message> = mutableListOf()   // История для Sticky (короткая)
 )
 
-// 2. Класс Агента
+// --- 2. Стратегии управления контекстом ---
+
+interface ContextStrategy {
+    fun getMessagesForApi(systemPrompt: String): List<Message>
+    fun addUserMessage(message: Message)
+    fun addAssistantMessage(message: Message)
+    fun getStats(): String
+    fun reset(systemPrompt: String)
+}
+
+// Стратегия 1: Sliding Window (Скользящее окно)
+class SlidingWindowStrategy(
+    private val state: AgentState,
+    private val windowSize: Int = 2,
+) : ContextStrategy {
+
+    override fun getMessagesForApi(systemPrompt: String): List<Message> {
+        val messages = state.slidingHistory.toMutableList()
+        // Убеждаемся, что System Prompt всегда первый
+        if (messages.isEmpty() || messages.first().role != "system") {
+            messages.add(0, Message("system", systemPrompt))
+        }
+        return messages
+    }
+
+    override fun addUserMessage(message: Message) {
+        state.slidingHistory.add(message)
+        trimHistory()
+    }
+
+    override fun addAssistantMessage(message: Message) {
+        state.slidingHistory.add(message)
+        trimHistory()
+    }
+
+    private fun trimHistory() {
+        // Оставляем System + N последних сообщений
+        // Индекс 0 - System. Если всего > windowSize + 1, удаляем с 1 по (size - windowSize)
+        if (state.slidingHistory.size > windowSize + 1) {
+            val keepCount = windowSize + 1
+            val history = state.slidingHistory.takeLast(keepCount)
+            state.slidingHistory.clear()
+            state.slidingHistory.addAll(history)
+            println("[Strategy: Sliding Window] Trimmed history to last $windowSize messages.")
+        }
+    }
+
+    override fun getStats(): String = "Messages in context: ${state.slidingHistory.size}"
+    override fun reset(systemPrompt: String) {
+        state.slidingHistory = mutableListOf(Message("system", systemPrompt))
+    }
+}
+
+// Стратегия 2: Sticky Facts (Факты)
+class StickyFactsStrategy(
+    private val state: AgentState,
+    private val llmCaller: (String) -> String? // Функция для вызова LLM
+) : ContextStrategy {
+
+    override fun getMessagesForApi(systemPrompt: String): List<Message> {
+        val messages = mutableListOf<Message>()
+
+        // 1. System Prompt
+        messages.add(Message("system", systemPrompt))
+
+        // 2. Facts Block
+        if (state.factsStore.facts.isNotEmpty()) {
+            val factsText = state.factsStore.facts.joinToString("\n")
+            messages.add(Message("system", "Важные факты из диалога:\n$factsText"))
+        }
+
+        // 3. Recent History
+        messages.addAll(state.stickyHistory)
+
+        return messages
+    }
+
+    override fun addUserMessage(message: Message) {
+        updateFacts(message.content) // Извлекаем факты
+        state.stickyHistory.add(message)
+        trimHistory()
+    }
+
+    override fun addAssistantMessage(message: Message) {
+        state.stickyHistory.add(message)
+        trimHistory()
+    }
+
+    private fun trimHistory() {
+        // Храним меньше истории, так как факты в отдельном блоке
+        val limit = 5
+        if (state.stickyHistory.size > limit) {
+            val history = state.stickyHistory.takeLast(limit)
+            state.stickyHistory.clear()
+            state.stickyHistory.addAll(history)
+        }
+    }
+
+    private fun updateFacts(userInput: String) {
+        val prompt = """
+            Проанализируй сообщение пользователя и извлеки из него ключевые факты (имена, даты, предпочтения, решения).
+            Верни результат ТОЛЬКО в формате строки: "fact1,fact2,...,fact10".
+            Если фактов нет, верни пустую строку.
+            Сообщение: "$userInput"
+        """.trimIndent()
+
+        val result = llmCaller(prompt)
+        if (result != null) {
+            try {
+                // Простая эвристика для парсинга JSON без сложных библиотек, если ответ пришел с markdown
+                //val jsonStr = result.substringAfter("{").substringBefore("}")
+                // В реальном проекте используйте Json.decodeFromString
+                //val resultMap: Map<String, String> = Json.decodeFromString(result)
+                val facts = result.split(",")
+                state.factsStore.facts.addAll(facts)
+                // Здесь упрощение: мы просто обновляем мапу
+                println("[Strategy: Facts] Detected potential facts: $result")
+                // Для демо просто добавим новый факт (в реальности нужно парсить и мержить)
+                // Здесь мы эмулируем обновление, в реальном коде нужен парсер Map<String, String>
+                // Для простоты, добавим в лог, что факт обновлен.
+            } catch (e: Exception) {
+                println("[Strategy: Facts] Failed to parse facts: $e")
+            }
+        }
+    }
+
+    override fun getStats(): String = "Facts count: ${state.factsStore.facts.size}, Recent msgs: ${state.stickyHistory.size}"
+    override fun reset(systemPrompt: String) {
+        state.factsStore = FactStore()
+        state.stickyHistory = mutableListOf(Message("system", systemPrompt))
+    }
+}
+
+// Стратегия 3: Branching (Ветвление)
+class BranchingStrategy(
+    private val state: AgentState
+) : ContextStrategy {
+
+    override fun getMessagesForApi(systemPrompt: String): List<Message> {
+        val currentBranch = state.branchData.activeBranch
+        val messages = state.branchData.branches[currentBranch]?.toMutableList() ?: mutableListOf()
+
+        if (messages.isEmpty() || messages.first().role != "system") {
+            messages.add(0, Message("system", systemPrompt))
+        }
+        return messages
+    }
+
+    override fun addUserMessage(message: Message) {
+        val branch = state.branchData.activeBranch
+        val list = state.branchData.branches.getOrPut(branch) { mutableListOf() }
+        (list as MutableList).add(message)
+    }
+
+    override fun addAssistantMessage(message: Message) {
+        val branch = state.branchData.activeBranch
+        val list = state.branchData.branches.getOrPut(branch) { mutableListOf() }
+        (list as MutableList).add(message)
+    }
+
+    fun createBranch(newId: String, fromCheckpoint: Int? = null) {
+        // Копируем текущую ветку в новую
+        val current = state.branchData.branches[state.branchData.activeBranch] ?: emptyList()
+        val checkpoint = fromCheckpoint ?: current.size // Если не указано, копируем всё
+
+        // Копируем часть истории (например, первые N сообщений)
+        val newHistory = current.take(checkpoint).toMutableList()
+        state.branchData.branches[newId] = newHistory
+        println("[Strategy: Branching] Created branch '$newId' with ${newHistory.size} messages.")
+    }
+
+    fun switchBranch(id: String) {
+        if (state.branchData.branches.containsKey(id)) {
+            state.branchData.activeBranch = id
+            println("[Strategy: Branching] Switched to branch '$id'.")
+        } else {
+            println("[Strategy: Branching] Branch '$id' not found.")
+        }
+    }
+
+    override fun getStats(): String {
+        val branches = state.branchData.branches.keys.joinToString(", ")
+        return "Active: ${state.branchData.activeBranch}, All branches: $branches"
+    }
+
+    override fun reset(systemPrompt: String) {
+        state.branchData = BranchData(
+            branches = mutableMapOf("main" to mutableListOf(Message("system", systemPrompt))),
+            activeBranch = "main"
+        )
+    }
+}
+
+// --- 3. Агент ---
 
 class RouterAIAgent(
     private val apiUrl: String,
     private val apiKey: String,
     private val model: String,
     private val systemPrompt: String = "Ты полезный ассистент.",
-    private val historyFile: File,
-    private val keepRecentMessages: Int = 10, // Сколько последних сообщений хранить "как есть"
-    private val summarizeThreshold: Int = 10  // Каждые сколько сообщений делать сжатие
+    private val stateFile: File
 ) {
-    // Состояние агента
-    private var summaryText: String? = null
-    private val recentHistory: MutableList<Message> = mutableListOf()
-
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = true }
-    private val client = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(20))
-        .build()
+    private var state = AgentState()
+    private val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build()
+
+    // Текущая стратегия (делегат)
+    private var currentStrategy: ContextStrategy = SlidingWindowStrategy(state)
 
     init {
         loadState()
-        // Если история пуста, добавляем системный промпт
-        if (recentHistory.isEmpty()) {
-            recentHistory.add(Message(role = "system", content = systemPrompt))
+        initStrategy()
+    }
+
+    private fun initStrategy() {
+        currentStrategy = when (state.strategyType) {
+            "SLIDING_WINDOW" -> SlidingWindowStrategy(state)
+            "FACTS" -> StickyFactsStrategy(state) { prompt -> callLLMRaw(prompt) }
+            "BRANCHING" -> BranchingStrategy(state)
+            else -> SlidingWindowStrategy(state)
         }
+        currentStrategy.reset(systemPrompt) // Сброс при смене стратегии или инициализация
+        println("Initialized strategy: ${state.strategyType}")
+    }
+
+    fun setStrategy(type: String) {
+        state.strategyType = type
+        initStrategy()
+        saveState()
     }
 
     fun sendMessage(userInput: String): String {
-        // 1. Добавляем сообщение пользователя
-        recentHistory.add(Message(role = "user", content = userInput))
+        val userMessage = Message("user", userInput)
+        currentStrategy.addUserMessage(userMessage)
 
-        // 2. Проверяем, нужно ли сжатие контекста
-        // Учитываем только сообщения user/assistant (не system)
-        val conversationLength = recentHistory.count { it.role != "system" }
+        val messagesForApi = currentStrategy.getMessagesForApi(systemPrompt)
+        val requestBody = ChatRequest(model, messagesForApi)
 
-        // Если превысили порог (например, 20 сообщений), запускаем суммаризацию
-        // оставляя при этом keepRecentMessages (10) последних
-        if (conversationLength >= (keepRecentMessages + summarizeThreshold)) {
-            println("[System] Threshold reached. Summarizing context...")
-            summarizeContext()
-        }
-
-        // 3. Формируем запрос к API
-        val messagesForApi = buildMessagesForApi()
-
-        val requestBody = ChatRequest(model = model, messages = messagesForApi)
-        val requestBodyString = json.encodeToString(requestBody)
-
-        val request = HttpRequest.newBuilder()
-            .uri(URI.create(apiUrl))
-            .header("Content-Type", "application/json")
-            .header("Authorization", "Bearer $apiKey")
-            .POST(HttpRequest.BodyPublishers.ofString(requestBodyString))
-            .build()
-
-        return try {
-            val response = client.send(request, HttpResponse.BodyHandlers.ofString())
-
-            if (response.statusCode() == 200) {
-                val chatResponse = json.decodeFromString<ChatResponse>(response.body())
-
-                if (chatResponse.error != null) {
-                    recentHistory.removeLast() // Откат
-                    return "API Error: ${chatResponse.error.message}"
-                }
-
-                val assistantMessage = chatResponse.choices?.firstOrNull()?.message
-
-                if (assistantMessage != null) {
-                    recentHistory.add(assistantMessage)
-                    saveState()
-
-                    // Статистика токенов
-                    val promptTokens = messagesForApi.sumOf { it.estimatedTokens }
-                    printTokenStats(chatResponse.usage, promptTokens, assistantMessage.estimatedTokens)
-
-                    assistantMessage.content
-                } else {
-                    recentHistory.removeLast()
-                    "Error: No response choices found."
-                }
-            } else {
-                recentHistory.removeLast()
-                "HTTP Error: ${response.statusCode()} - ${response.body()}"
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            recentHistory.removeLast()
-            "Exception: ${e.message}"
-        }
-    }
-
-    // Метод формирования сообщений для API: Summary + Recent History
-    private fun buildMessagesForApi(): List<Message> {
-        val fullList = mutableListOf<Message>()
-
-        // 1. Если есть summary, добавляем его как System сообщение в начало
-        if (!summaryText.isNullOrBlank()) {
-            fullList.add(Message(role = "system", content = "Краткая сводка предыдущих разговоров: $summaryText"))
-        }
-
-        // 2. Добавляем последние сообщения
-        // Важно: если summary нет, то первое сообщение в recentHistory должно быть system prompt
-        fullList.addAll(recentHistory)
-
-        return fullList
-    }
-
-    // Метод сжатия контекста
-    private fun summarizeContext() {
-        // Берем сообщения для сжатия (все, кроме последних keepRecentMessages)
-        // Также исключаем текущий System Prompt (он всегда первый в recentHistory)
-
-        // Индекс, до которого будем суммаризировать
-        // Структура recentHistory: [SystemPrompt, User1, Asst1, User2, Asst2, ... UserLast]
-        // Мы хотим оставить [SystemPrompt, ... UserLast-keepRecent]
-
-        // Считаем сколько сообщений "сверху" забрать.
-        // Если recentHistory = [Sys, U1, A1, U2, A2, U3, A3], keep=2.
-        // Надо забрать [U1, A1] в summary. Оставить [Sys, U2, A2, U3, A3].
-
-        // Вычисляем индекс разделителя.
-        // System prompt (1) + (Total - keepRecent - 1) ?
-        // Проще: взять срез от индекса 1 (пропуск system) до (size - keepRecent)
-
-        val totalSize = recentHistory.size
-        // Оставляем System (index 0) и последние N сообщений
-        val splitIndex = totalSize - keepRecentMessages
-
-        if (splitIndex <= 1) return // Нечего суммаризировать
-
-        val toSummarize = recentHistory.subList(1, splitIndex).toList()
-
-        if (toSummarize.isEmpty()) return
-
-        // Формируем промпт для суммаризации
-        val historyText = toSummarize.joinToString("\n") { "${it.role}: ${it.content}" }
-        val summaryPrompt = """
-            Проанализируй следующую часть диалога и составь краткую сводку (summary) основных фактов, решений и контекста.
-            Диалог:
-            $historyText
-            
-            Сводка (на русском языке):
-        """.trimIndent()
-
-        // Делаем отдельный запрос к LLM для получения summary
-        val summaryResult = callLLMForSummary(summaryPrompt)
-
-        if (summaryResult != null) {
-            // Обновляем summary текст (добавляем к старому, если было)
-            if (summaryText.isNullOrBlank()) {
-                summaryText = summaryResult
-            } else {
-                summaryText += "\nНовые детали: $summaryResult"
-            }
-
-            // Удаляем старые сообщения из recentHistory
-            // (удаляем элементы с 1 по splitIndex)
-            // subList возвращает view, и clear() удаляет их из оригинального списка
-            recentHistory.subList(1, splitIndex).clear()
-
-            println("[System] Context summarized. New history size: ${recentHistory.size}")
-            saveState()
-        }
-    }
-
-    // Вспомогательный метод для вызова LLM (для суммаризации)
-    private fun callLLMForSummary(prompt: String): String? {
-        val messages = listOf(Message(role = "user", content = prompt))
-        val requestBody = ChatRequest(model = model, messages = messages)
-
+        // ... (HTTP Request logic same as before) ...
         val request = HttpRequest.newBuilder()
             .uri(URI.create(apiUrl))
             .header("Content-Type", "application/json")
@@ -253,105 +316,124 @@ class RouterAIAgent(
             val response = client.send(request, HttpResponse.BodyHandlers.ofString())
             if (response.statusCode() == 200) {
                 val chatResponse = json.decodeFromString<ChatResponse>(response.body())
-                chatResponse.choices?.firstOrNull()?.message?.content
-            } else null
+                if (chatResponse.error != null) return "Error: ${chatResponse.error.message}"
+
+                val assistantMsg = chatResponse.choices?.firstOrNull()?.message
+                if (assistantMsg != null) {
+                    currentStrategy.addAssistantMessage(assistantMsg)
+                    saveState()
+                    println(currentStrategy.getStats())
+                    assistantMsg.content
+                } else "Error: No response"
+            } else "HTTP Error: ${response.body()}"
         } catch (e: Exception) {
-            println("Error during summarization: ${e.message}")
-            null
+            e.printStackTrace()
+            "Exception: ${e.message}"
         }
     }
 
-    private fun printTokenStats(apiUsage: Usage?, estimatedPrompt: Int, estimatedCompletion: Int) {
-        println("\n--- Token Stats ---")
-        println("Context sent tokens (Est): $estimatedPrompt")
-        if (apiUsage != null) {
-            println("API Reported Prompt: ${apiUsage.promptTokens}, Completion: ${apiUsage.completionTokens}")
+    // Специфичные команды для Branching
+    fun createBranch(name: String) {
+        if (currentStrategy is BranchingStrategy) {
+            (currentStrategy as BranchingStrategy).createBranch(name)
+            saveState()
+        } else {
+            println("Command only available in BRANCHING mode.")
         }
-        println("--------------------")
     }
 
-    fun resetContext() {
-        recentHistory.clear()
-        summaryText = null
-        recentHistory.add(Message(role = "system", content = systemPrompt))
-        saveState()
-        println("Контекст полностью очищен.")
+    fun switchBranch(name: String) {
+        if (currentStrategy is BranchingStrategy) {
+            (currentStrategy as BranchingStrategy).switchBranch(name)
+            saveState()
+        } else {
+            println("Command only available in BRANCHING mode.")
+        }
     }
 
-    fun printCurrentState() {
-        println("Summary exists: ${!summaryText.isNullOrBlank()}")
-        println("Recent messages count: ${recentHistory.size}")
-        val totalTokens = buildMessagesForApi().sumOf { it.estimatedTokens }
-        println("Total active context tokens (Est): $totalTokens")
+    // Вспомогательный вызов LLM для Facts
+    private fun callLLMRaw(prompt: String): String? {
+        val messages = listOf(Message("user", prompt))
+        val req = ChatRequest(model, messages)
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create(apiUrl))
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer $apiKey")
+            .POST(HttpRequest.BodyPublishers.ofString(json.encodeToString(req)))
+            .build()
+        return try {
+            val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+            json.decodeFromString<ChatResponse>(response.body()).choices?.firstOrNull()?.message?.content
+        } catch (e: Exception) { null }
     }
 
-    // Сохранение и загрузка состояния
     private fun saveState() {
-        try {
-            val state = AgentState(summary = summaryText, recentMessages = recentHistory)
-            historyFile.writeText(json.encodeToString(state))
-        } catch (e: Exception) {
-            println("Error saving state: ${e.message}")
-        }
+        stateFile.writeText(json.encodeToString(state))
     }
 
     private fun loadState() {
-        try {
-            if (historyFile.exists()) {
-                val text = historyFile.readText()
-                if (text.isNotBlank()) {
-                    val state = json.decodeFromString<AgentState>(text)
-                    this.summaryText = state.summary
-                    this.recentHistory.clear()
-                    this.recentHistory.addAll(state.recentMessages)
-                    println("State loaded. Summary: ${if(summaryText != null) "Yes" else "No"}, Recent: ${recentHistory.size}")
-                }
-            }
-        } catch (e: Exception) {
-            println("Error loading state: ${e.message}")
+        if (stateFile.exists()) {
+            try {
+                state = json.decodeFromString(stateFile.readText())
+            } catch (e: Exception) { println("Failed to load state: ${e.message}") }
         }
+    }
+
+    fun resetAll() {
+        state = AgentState()
+        initStrategy()
+        saveState()
     }
 }
 
-// 3. Main
+// --- 4. Main ---
 
 fun main() {
     val url = URL
     val key = API_KEY
-    val modelId = DEFAULT_MODEL // Или deepseek/deepseek-chat
+    val modelId = DEFAULT_MODEL
+    val stateFile = File("agent_multi_strategy.json")
 
-    // Файл теперь хранит структуру AgentState
-    val historyFile = File("agent_state.json")
+    val agent = RouterAIAgent(url, key, modelId, stateFile = stateFile)
 
-    // keepRecentMessages = 4 (2 пары вопрос-ответ)
-    // summarizeThreshold = 4 (сжимать каждые 4 сообщения сверх лимита)
-    val agent = RouterAIAgent(
-        apiUrl = url,
-        apiKey = key,
-        model = modelId,
-        historyFile = historyFile,
-        keepRecentMessages = 2, // Хранить только 2 последних сообщения
-        summarizeThreshold = 2  // Сжимать каждые 2 сообщения сверх лимита
-    )
-
-    println("--- Agent with Summary Context ---")
-    println("Commands: 'exit', 'clear', 'stats'")
+    println("Agent Ready. Commands: /strategy <window|facts|branch>, /branch <new|switch> <name>, /reset, exit")
 
     while (true) {
-        print("Вы: ")
+        print("You: ")
         val input = readlnOrNull() ?: break
 
-        if (input.equals("exit", ignoreCase = true)) break
-        if (input.equals("clear", ignoreCase = true)) {
-            agent.resetContext()
+        if (input.startsWith("exit")) return
+
+        if (input.startsWith("/strategy")) {
+            val type = input.split(" ").getOrNull(1) ?: ""
+            when(type) {
+                "window" -> agent.setStrategy("SLIDING_WINDOW")
+                "facts" -> agent.setStrategy("FACTS")
+                "branch" -> agent.setStrategy("BRANCHING")
+                else -> println("Unknown strategy. Use: window, facts, branch")
+            }
             continue
         }
-        if (input.equals("stats", ignoreCase = true)) {
-            agent.printCurrentState()
+
+        if (input.startsWith("/branch")) {
+            val parts = input.split(" ")
+            if (parts.size >= 3) {
+                val cmd = parts[1]
+                val name = parts[2]
+                if (cmd == "new") agent.createBranch(name)
+                if (cmd == "switch") agent.switchBranch(name)
+            } else {
+                println("Usage: /branch new <name> OR /branch switch <name>")
+            }
+            continue
+        }
+
+        if (input == "/reset") {
+            agent.resetAll()
             continue
         }
 
         val response = agent.sendMessage(input)
-        println("Агент: $response")
+        println("Agent: $response")
     }
 }
